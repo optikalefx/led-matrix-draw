@@ -1,0 +1,8 @@
+# Wi-Fi credentials
+secrets.h
+
+# Build and tooling output
+build/
+__pycache__/
+*.pyc
+.DS_Store
