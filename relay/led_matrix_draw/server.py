@@ -1,7 +1,6 @@
 """HTTP relay: ESP32 audio -> OpenAI speech to text -> Claude -> 16x16 RGB pixels."""
 
 import asyncio
-import base64
 import io
 import json
 import logging
@@ -21,8 +20,10 @@ from aiohttp import web
 GRID = 16
 PORT = 8765
 OPTIONS_PATH = "/data/options.json"
-RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_runner.py")
-DEFAULT_MAX_FRAMES = 30   # the ESP32 sends its real limit in X-Max-Frames
+LUA_RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lua_runner.lua")
+LUA_BIN = os.environ.get("LUA_BIN", "lua5.4")
+PREVIEW_SECONDS = 4   # how much of a Lua animation the preview page shows
+PREVIEW_FPS = 30
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("led_matrix_draw")
@@ -222,109 +223,128 @@ def code_request(text: str):
 
 CODE_TOOL = {
     "name": "write_animation_code",
-    "description": "Write a Python draw() function that renders each frame of a looping animation "
-                   "on a 16x16 RGB LED matrix.",
+    "description": "Write a Lua 5.4 script with a draw(t) function that animates a 16x16 RGB LED "
+                   "matrix live on the device.",
     "input_schema": {
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "Short name of the animation."},
-            "code": {"type": "string", "description": "Python source defining draw(canvas, t, i)."},
-            "frames": {"type": "integer", "description": "Number of frames in the loop."},
-            "frame_ms": {"type": "integer", "description": "Milliseconds per frame (at least 40)."},
+            "code": {"type": "string", "description": "Lua source defining draw(t)."},
         },
-        "required": ["title", "code", "frames", "frame_ms"],
+        "required": ["title", "code"],
     },
 }
 
-CODE_PROMPT = """You write short Python programs that animate a 16x16 RGB LED matrix.
+CODE_PROMPT = """You write short Lua 5.4 scripts that animate a 16x16 RGB LED matrix. The script runs
+live on a small microcontroller (ESP32, 240 MHz), forever, until the user asks for something else.
 
-Define exactly this function:
+Define:
 
-    def draw(canvas, t, i):
+    function draw(t)
 
-- It is called once per frame on a fresh, black canvas. t runs from 0 up to (not including) 1
-  across the loop; i is the frame index. The animation loops forever, so t=1 must look like t=0:
-  drive motion with sin/cos of 2*math.pi*t, or motion that wraps around exactly once.
-- canvas.set(x, y, color), canvas.get(x, y), canvas.fill(color), canvas.clear(),
-  canvas.rect(x, y, w, h, color), canvas.line(x0, y0, x1, y1, color),
-  canvas.circle(cx, cy, r, color, filled=True).
-  x is 0-15 left to right, y is 0-15 top to bottom. Floats are rounded; off-canvas pixels are ignored.
-- Colors are (r, g, b) tuples, 0-255. hsv(h, s, v) with all values 0-1 returns a color.
-  blend(a, b, amount) mixes two colors.
-- Available names: math, random (seeded, so it is the same every run), hsv, blend, WIDTH, HEIGHT,
-  and basic builtins (range, len, min, max, abs, int, float, round, sum, enumerate, zip, list...).
-- Not available: imports, print, open, files, network, or any name/attribute starting with "_".
-- Top-level code runs once before the first frame: precompute things there (random star positions,
-  particle paths). Keep draw() fast: every frame must render in a few milliseconds.
+- It is called about 30 times per second on a canvas that has been cleared to black. t is seconds
+  since the animation started (a float). Drive all motion from t so speed doesn't depend on frame
+  rate. It never has to loop: animations can evolve forever (use t, math.sin, math.random).
+- Top-level code runs once: precompute there. State that changes between frames (particles,
+  positions) lives in top-level locals; update it in draw(t) using dt = t - previous t.
 
-Make it look good on LEDs:
-- Bold, saturated colors on black. Dark colors (below ~40 per channel) look off.
-- Big, simple shapes; this is only 16x16. Use smooth motion, trails or glow via blend() where it helps.
+Drawing (x is 0-15 left to right, y is 0-15 top to bottom; coordinates are rounded to the nearest
+pixel; anything off the canvas is ignored):
+- set(x, y, color), get(x, y), fill(color), rect(x, y, w, h, color),
+  line(x0, y0, x1, y1, color), circle(cx, cy, r, color [, filled=true])
+- sprite(rows, palette, x, y [, flip]): rows is a table of equal-length strings, palette maps a
+  character to a color; characters not in the palette (use '.') are transparent. flip mirrors it.
+- Colors are integers 0xRRGGBB. rgb(r, g, b) with 0-255 returns a color; hsv(h, s, v) with all
+  values 0-1 returns a color; blend(a, b, amount) mixes two colors. Never pass strings or tables
+  as colors.
 
-Timing: choose frames (at most {max_frames}) and frame_ms (40-200). More frames with a shorter
-frame_ms is smoother. A loop of 1-3 seconds (frames * frame_ms) usually feels right.
+Environment:
+- Available: math, string, table, pairs, ipairs, select, tonumber, tostring, type, pcall, error.
+- Not available: io, os, require, load, dofile, coroutine, debug. print does nothing.
+- Numbers are 32-bit on the device: fine for animation math, but don't use integers above
+  2 billion or rely on high float precision.
+- Stay small and fast: under ~40 KB of data (a few hundred numbers; prefer flat arrays over many
+  small tables) and a few hundred drawing calls per frame at most.
+
+Characters and objects vs effects:
+- For a character or object (cat, bird, person, rocket, heart...), hand-draw it as pixel-art
+  sprite(s) with sprite() and a palette, as big as the scene allows. Animate by moving, bobbing or
+  flipping it, and for walking, flapping or blinking switch between 2-4 sprite poses based on t.
+- Use shapes, particles, gradients and math for effects: fire, rain, sparkles, stars, water,
+  smoke, trails, explosions. Combine both when it helps (a rocket sprite with a particle exhaust).
+
+Make it look good on LEDs: bold, saturated colors on black. Dark colors (below ~40 per channel)
+look off. Big, simple shapes; this is only 16x16.
 
 Always call write_animation_code exactly once."""
 
 
-async def run_sandboxed(code: str, frames: int) -> list:
-    """Runs draw() in the sandbox runner; returns a list of 768-byte frames or raises ValueError."""
+def _limit_resources():
+    import resource
+    resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
+    resource.setrlimit(resource.RLIMIT_AS, (256 << 20, 256 << 20))
+
+
+async def run_lua(code: str) -> dict:
+    """Test-runs a script like the device will; returns preview frames or raises ValueError."""
+    frames = PREVIEW_SECONDS * PREVIEW_FPS
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-I", RUNNER,
+        LUA_BIN, LUA_RUNNER, str(frames), str(PREVIEW_FPS),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env={})
+        env={}, preexec_fn=_limit_resources if sys.platform == "linux" else None)
     try:
-        out, err = await asyncio.wait_for(
-            proc.communicate(json.dumps({"code": code, "frames": frames}).encode()), timeout=5)
+        out, err = await asyncio.wait_for(proc.communicate(code.encode()), timeout=10)
     except asyncio.TimeoutError:
         proc.kill()
-        raise ValueError("the code took too long to run (over 5 seconds)")
+        raise ValueError("the script took too long to run")
     try:
         result = json.loads(out or b"{}")
     except json.JSONDecodeError:
         result = {}
     if "frames" not in result:
-        raise ValueError(result.get("error") or f"the code crashed: {err.decode()[-300:]}")
-    data = base64.b64decode(result["frames"])
-    return [data[k:k + GRID * GRID * 3] for k in range(0, len(data), GRID * GRID * 3)]
+        raise ValueError(result.get("error") or f"the script crashed: {err.decode()[-300:]}")
+    data = bytes.fromhex(result["frames"])
+    size = GRID * GRID * 3
+    return {"frames": [data[k:k + size] for k in range(0, len(data), size)], "fps": result["fps"],
+            "memory_kb": result["memory_kb"], "max_instructions": result["max_instructions"]}
 
 
-async def code_animation(session: aiohttp.ClientSession, request_text: str, model: str,
-                         max_frames: int) -> dict:
-    """Asks Claude for draw() code and runs it; retries once with the error if it fails."""
-    system = CODE_PROMPT.replace("{max_frames}", str(max_frames))
+async def code_animation(session: aiohttp.ClientSession, request_text: str, model: str) -> dict:
+    """Asks Claude for a Lua script and test-runs it; retries once with the error if it fails."""
     messages = [{"role": "user", "content": f"Animate: {request_text}"}]
     last_error = None
     for attempt in range(2):
-        block = await call_claude(session, model, system, CODE_TOOL, messages)
-        spec = block["input"]
-        frames = max(1, min(max_frames, int(spec.get("frames") or max_frames)))
+        block = await call_claude(session, model, CODE_PROMPT, CODE_TOOL, messages)
+        code = block["input"].get("code", "")
         try:
-            rendered = await run_sandboxed(spec.get("code", ""), frames)
-            return {"title": spec.get("title", ""), "frames": rendered, "code": spec.get("code", ""),
-                    "frame_ms": max(40, min(2000, int(spec.get("frame_ms") or 80))), "mode": "code"}
+            run = await run_lua(code)
+            log.info("lua script ok: %d bytes, %.1f KB memory, %d instructions/frame",
+                     len(code), run["memory_kb"], run["max_instructions"])
+            return {"title": block["input"].get("title", ""), "frames": run["frames"], "code": code,
+                    "frame_ms": round(1000 / run["fps"]), "mode": "lua"}
         except ValueError as e:
             last_error = e
-            log.warning("code attempt %d failed: %s", attempt + 1, e)
+            log.warning("lua attempt %d failed: %s", attempt + 1, e)
             messages += [
                 {"role": "assistant", "content": [block]},
                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": block["id"],
                                               "is_error": True,
-                                              "content": f"{e}. Fix the code and call the tool again."}]},
+                                              "content": f"{e}. Fix the script and call the tool again."}]},
             ]
-    raise web.HTTPBadGateway(text=f"animation code failed twice: {last_error}")
+    raise web.HTTPBadGateway(text=f"animation script failed twice: {last_error}")
 
 
-async def create(session: aiohttp.ClientSession, text: str, model: str = None,
-                 max_frames: int = DEFAULT_MAX_FRAMES) -> dict:
-    """Turns a request into {title, frames (768-byte each), frame_ms, mode, code}."""
+async def create(session: aiohttp.ClientSession, text: str, model: str = None) -> dict:
+    """Turns a request into {title, frames (768 bytes each), frame_ms, mode, code}.
+
+    For mode "lua" the device gets the script itself; frames are only the relay's preview."""
     code_text = code_request(text)
     if code_text:
         # Code mode is Claude-only; fall back to Sonnet if a Gemini model is configured
         claude_model = model or OPTIONS["claude_model"]
         if not claude_model.startswith("claude"):
             claude_model = "claude-sonnet-5"
-        return await code_animation(session, code_text, claude_model, max_frames)
+        return await code_animation(session, code_text, claude_model)
     drawing = await draw(session, text, model)
     frames = to_frames(drawing)
     return {"title": drawing.get("title", ""), "frames": frames, "frame_ms": frame_ms(drawing),
@@ -421,28 +441,22 @@ def to_frames(drawing: dict) -> list:
 LAST = {"transcript": None, "result": None, "at": None, "wav": None}
 
 
-def max_frames_for(request: web.Request) -> int:
-    try:
-        return max(1, min(64, int(request.headers.get("X-Max-Frames", DEFAULT_MAX_FRAMES))))
-    except ValueError:
-        return DEFAULT_MAX_FRAMES
-
-
-def pixel_response(transcript: str, result: dict, draw_seconds: float) -> web.Response:
+def pixel_response(transcript: str, result: dict, draw_seconds: float,
+                   preview: bool = False) -> web.Response:
     LAST.update(transcript=transcript, result=result, at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    headers = {
+        "X-Transcript": urllib.parse.quote(transcript),
+        "X-Title": urllib.parse.quote(result["title"]),
+        "X-Mode": result["mode"],
+        "X-Draw-Seconds": f"{draw_seconds:.2f}",
+    }
+    if result["mode"] == "lua" and not preview:
+        # The device runs the script itself
+        return web.Response(body=result["code"].encode(), content_type="text/x-lua", headers=headers)
     frames = result["frames"]
-    return web.Response(
-        body=b"".join(frames),
-        content_type="application/octet-stream",
-        headers={
-            "X-Transcript": urllib.parse.quote(transcript),
-            "X-Title": urllib.parse.quote(result["title"]),
-            "X-Mode": result["mode"],
-            "X-Frames": str(len(frames)),
-            "X-Frame-Ms": str(result["frame_ms"]),
-            "X-Draw-Seconds": f"{draw_seconds:.2f}",
-        },
-    )
+    headers["X-Frames"] = str(len(frames))
+    headers["X-Frame-Ms"] = str(result["frame_ms"])
+    return web.Response(body=b"".join(frames), content_type="application/octet-stream", headers=headers)
 
 
 async def handle_draw(request: web.Request) -> web.Response:
@@ -466,7 +480,7 @@ async def handle_draw(request: web.Request) -> web.Response:
     if not transcript:
         raise web.HTTPUnprocessableEntity(text="no speech detected")
 
-    result = await create(session, transcript, max_frames=max_frames_for(request))
+    result = await create(session, transcript)
     draw_seconds = time.monotonic() - stt_done
     log.info("drew %r (%s, %d frames) in %.1fs (total %.1fs)", result["title"], result["mode"],
              len(result["frames"]), draw_seconds, time.monotonic() - started)
@@ -480,11 +494,12 @@ async def handle_draw_text(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="empty body")
     # Optional model override for comparing models, e.g. ?model=claude-haiku-4-5-20251001
     model = request.query.get("model")
-    result = await create(request.app["http"], text, model, max_frames_for(request))
+    result = await create(request.app["http"], text, model)
     draw_seconds = time.monotonic() - started
     log.info("drew %r (%s, %d frames) for %r with %s in %.1fs", result["title"], result["mode"],
              len(result["frames"]), text, model or OPTIONS["claude_model"], draw_seconds)
-    return pixel_response(text, result, draw_seconds)
+    # ?preview=1 returns the relay's rendered frames even for Lua scripts (for test tools)
+    return pixel_response(text, result, draw_seconds, preview=bool(request.query.get("preview")))
 
 
 async def handle_last_wav(request: web.Request) -> web.Response:

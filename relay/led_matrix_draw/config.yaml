@@ -1,5 +1,5 @@
 name: LED Matrix Draw
-version: "0.4.0"
+version: "0.5.0"
 slug: led_matrix_draw
 description: Relay for the ESP32 LED matrix - speech to text, then text to 16x16 pixel art
 arch:

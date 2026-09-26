@@ -5,13 +5,13 @@
 #include <HTTPClient.h>
 #include <FastLED.h>
 #include "secrets.h"
+#include "panel.h"
+#include "lua_anim.h"
 
 #define LED_PIN     13
 #define MIC_PIN     34
 #define BUTTON_PIN  27
 
-#define GRID        16
-#define NUM_LEDS    (GRID * GRID)
 #define BRIGHTNESS  40
 #define MAX_MILLIAMPS 500   // powered from USB; raise with a real 5V supply
 
@@ -21,19 +21,20 @@
 #define MIC_GAIN    16                       // 12-bit ADC -> 16-bit PCM
 #define DOUBLE_TAP_MS 500                    // two quick taps within this clear the panel
 
-#define MAX_FRAMES  64                       // upper limit; the real limit depends on free memory
+#define MAX_FRAMES  4                        // hand-drawn animations; code animations run as Lua
 #define FRAME_BYTES (NUM_LEDS * 3)           // one frame: 16x16 RGB, row-major, top-left first
+#define MAX_SCRIPT_BYTES 16384               // largest Lua animation script we accept
 
 enum State { CONNECTING, IDLE, SHOWING, RECORDING, THINKING, ERROR_SHOWN };
 
 CRGB leds[NUM_LEDS];
-uint8_t *frameData = nullptr;   // maxFrames * FRAME_BYTES, allocated at boot
-int maxFrames = 0;
+uint8_t *frameData = nullptr;   // MAX_FRAMES * FRAME_BYTES, allocated at boot
 volatile State state = CONNECTING;
 volatile bool hasPicture = false;
 volatile int frameCount = 0;
 volatile uint16_t frameMs = 250;
 volatile uint32_t animStart = 0;
+volatile bool luaRunning = false;   // SHOWING a Lua script instead of stored frames
 volatile int micLevel = 0;
 volatile uint32_t errorUntil = 0;
 
@@ -45,16 +46,6 @@ uint32_t lastTapAt = 0;
 uint8_t spiralX[NUM_LEDS], spiralY[NUM_LEDS];
 
 // ---------- display (runs on core 0) ----------
-
-// Panel is column-serpentine: LED 0 top-left, first 16 run down the left column,
-// the next 16 run back up the second column, and so on.
-uint16_t xyToIndex(int x, int y) {
-  return x * GRID + ((x & 1) ? (GRID - 1 - y) : y);
-}
-
-void setXY(int x, int y, CRGB c) {
-  if (x >= 0 && x < GRID && y >= 0 && y < GRID) leds[xyToIndex(x, y)] = c;
-}
 
 // Position i (0..59) clockwise around the outer edge
 void borderXY(int i, int &x, int &y) {
@@ -76,7 +67,19 @@ void buildSpiral() {
   }
 }
 
+void showError();
+
 void drawPicture() {
+  if (luaRunning) {
+    String error;
+    if (!luaAnimDraw((millis() - animStart) / 1000.0f, error)) {
+      Serial.printf("lua %s\n", error.c_str());
+      luaRunning = false;
+      hasPicture = false;
+      showError();
+    }
+    return;
+  }
   int f = frameCount > 1 ? ((millis() - animStart) / frameMs) % frameCount : 0;
   const uint8_t *px = frameData + f * FRAME_BYTES;
   for (int y = 0; y < GRID; y++)
@@ -219,6 +222,42 @@ String urlDecode(const String &s) {
   return out;
 }
 
+// Body is a Lua script defining draw(t); the display task runs it live
+bool loadLuaResponse(HTTPClient &http) {
+  int length = http.getSize();
+  if (length <= 0 || length > MAX_SCRIPT_BYTES) {
+    Serial.printf("bad script size: %d bytes\n", length);
+    return false;
+  }
+  char *source = (char *)malloc(length);
+  if (!source) {
+    Serial.println("not enough memory for the script");
+    return false;
+  }
+  int got = 0;
+  WiFiClient *stream = http.getStreamPtr();
+  uint32_t readStart = millis();
+  while (got < length && millis() - readStart < 10000) {
+    int avail = stream->available();
+    if (avail > 0) got += stream->read((uint8_t *)source + got, min(avail, length - got));
+    else delay(1);
+  }
+
+  String error;
+  bool ok = got == length && luaAnimLoad(source, length, error);
+  free(source);
+  if (!ok) {
+    Serial.printf("lua %s\n", got == length ? error.c_str() : "script download was cut short");
+    return false;
+  }
+  Serial.printf("lua script running: %d bytes, %u bytes of Lua memory\n", length,
+                (unsigned)luaAnimMemoryUsed());
+  animStart = millis();
+  luaRunning = true;
+  hasPicture = true;
+  return true;
+}
+
 bool sendToRelay(size_t samples) {
   HTTPClient http;
   http.begin(String(RELAY_URL) + "/draw");
@@ -226,9 +265,8 @@ bool sendToRelay(size_t samples) {
   http.setTimeout(45000);
   http.addHeader("Content-Type", "application/octet-stream");
   http.addHeader("X-Sample-Rate", String(SAMPLE_RATE));
-  http.addHeader("X-Max-Frames", String(maxFrames));   // code animations are sized to fit
-  const char *keys[] = {"X-Transcript", "X-Title", "X-Frames", "X-Frame-Ms"};
-  http.collectHeaders(keys, 4);
+  const char *keys[] = {"X-Transcript", "X-Title", "X-Mode", "X-Frames", "X-Frame-Ms"};
+  http.collectHeaders(keys, 5);
 
   uint32_t t0 = millis();
   int code = http.POST(audioBuf, samples);
@@ -239,13 +277,26 @@ bool sendToRelay(size_t samples) {
     return false;
   }
 
-  // Body is X-Frames frames of FRAME_BYTES each. Safe to write frameData here:
-  // the display task only reads it in the SHOWING state, and we're in THINKING.
-  int frames = constrain(http.header("X-Frames").toInt(), 1, maxFrames);
+  // Safe to replace frameData or the Lua script here: the display task only uses them
+  // in the SHOWING state, and we're in THINKING.
+  hasPicture = false;
+  luaRunning = false;
+  String title = urlDecode(http.header("X-Title"));
+  Serial.printf("heard: \"%s\" -> %s: %s (%.1fs)\n", urlDecode(http.header("X-Transcript")).c_str(),
+                http.header("X-Mode").c_str(), title.c_str(), (millis() - t0) / 1000.0);
+
+  if (http.header("X-Mode") == "lua") {
+    bool ok = loadLuaResponse(http);
+    http.end();
+    return ok;
+  }
+  luaAnimClose();   // free the previous script's memory
+
+  // Body is X-Frames frames of FRAME_BYTES each
+  int frames = constrain(http.header("X-Frames").toInt(), 1, MAX_FRAMES);
   int ms = http.header("X-Frame-Ms").toInt();
   size_t want = (size_t)frames * FRAME_BYTES;
   size_t got = 0;
-  hasPicture = false;
   WiFiClient *stream = http.getStreamPtr();
   uint32_t readStart = millis();
   while (got < want && millis() - readStart < 10000) {
@@ -253,11 +304,6 @@ bool sendToRelay(size_t samples) {
     if (avail > 0) got += stream->read(frameData + got, min((size_t)avail, want - got));
     else delay(1);
   }
-  Serial.printf("heard: \"%s\" -> drew: %s, %d frame%s (%.1fs)\n",
-                urlDecode(http.header("X-Transcript")).c_str(),
-                urlDecode(http.header("X-Title")).c_str(),
-                frames, frames == 1 ? "" : "s",
-                (millis() - t0) / 1000.0);
   http.end();
 
   if (got != want) {
@@ -297,20 +343,17 @@ void setup() {
   FastLED.setBrightness(BRIGHTNESS);
   FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MILLIAMPS);
   buildSpiral();
-  xTaskCreatePinnedToCore(displayTask, "display", 4096, nullptr, 1, nullptr, 0);
+  // Lua scripts run on this task, so it needs a bigger stack than plain drawing
+  xTaskCreatePinnedToCore(displayTask, "display", 16384, nullptr, 1, nullptr, 0);
 
   connectWiFi();
 
-  // Audio gets first pick of memory; animation frames get what's left
+  frameData = (uint8_t *)malloc(MAX_FRAMES * FRAME_BYTES);
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   audioCap = min((size_t)(SAMPLE_RATE * MAX_SECONDS), largest > 20000 ? largest - 20000 : 0);
   audioBuf = (uint8_t *)malloc(audioCap);
-
-  largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  maxFrames = constrain((int)((largest > 24000 ? largest - 24000 : 0) / FRAME_BYTES), 1, MAX_FRAMES);
-  frameData = (uint8_t *)malloc(maxFrames * FRAME_BYTES);
-  Serial.printf("audio buffer: %.1fs max, %d animation frames, %u bytes heap free\n",
-                (float)audioCap / SAMPLE_RATE, maxFrames, (unsigned)ESP.getFreeHeap());
+  Serial.printf("audio buffer: %.1fs max, %u bytes heap free for Lua and Wi-Fi\n",
+                (float)audioCap / SAMPLE_RATE, (unsigned)ESP.getFreeHeap());
 
   state = IDLE;
 }
@@ -336,6 +379,10 @@ void loop() {
   if (samples < MIN_SAMPLES) {
     if (lastTapAt && millis() - lastTapAt < DOUBLE_TAP_MS) {
       hasPicture = false;
+      luaRunning = false;
+      state = IDLE;
+      delay(50);   // let the display task finish any frame it was drawing
+      luaAnimClose();
       lastTapAt = 0;
       Serial.println("double tap: cleared");
     } else {
