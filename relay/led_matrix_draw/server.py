@@ -39,7 +39,6 @@ def load_options():
         "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
         "stt_model": os.environ.get("STT_MODEL", "gpt-4o-mini-transcribe"),
         "claude_model": os.environ.get("CLAUDE_MODEL", "claude-sonnet-5"),
-        "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
     }
 
 
@@ -160,13 +159,6 @@ Animation rules:
 - frame_ms: usually 150-300 for lively motion, 300-500 for gentle motion like swaying or breathing."""
 
 
-async def draw(session: aiohttp.ClientSession, prompt: str, model: str = None) -> dict:
-    model = model or OPTIONS["claude_model"]
-    if model.startswith("gemini"):
-        return await draw_gemini(session, prompt, model)
-    return await draw_claude(session, prompt, model)
-
-
 async def call_claude(session: aiohttp.ClientSession, model: str, system: str, tool: dict,
                       messages: list) -> dict:
     """Forces one call of `tool` and returns that tool_use block."""
@@ -196,8 +188,8 @@ async def call_claude(session: aiohttp.ClientSession, model: str, system: str, t
     raise web.HTTPBadGateway(text="Claude did not call the tool")
 
 
-async def draw_claude(session: aiohttp.ClientSession, prompt: str, model: str) -> dict:
-    block = await call_claude(session, model,
+async def draw(session: aiohttp.ClientSession, prompt: str) -> dict:
+    block = await call_claude(session, OPTIONS["claude_model"],
                               SYSTEM_PROMPT + "\n- Always call the draw_pixel_art tool exactly once.",
                               DRAW_TOOL, [{"role": "user", "content": f"Draw: {prompt}"}])
     return block["input"]
@@ -309,12 +301,12 @@ async def run_lua(code: str) -> dict:
             "memory_kb": result["memory_kb"], "max_instructions": result["max_instructions"]}
 
 
-async def code_animation(session: aiohttp.ClientSession, request_text: str, model: str) -> dict:
+async def code_animation(session: aiohttp.ClientSession, request_text: str) -> dict:
     """Asks Claude for a Lua script and test-runs it; retries once with the error if it fails."""
     messages = [{"role": "user", "content": f"Animate: {request_text}"}]
     last_error = None
     for attempt in range(2):
-        block = await call_claude(session, model, CODE_PROMPT, CODE_TOOL, messages)
+        block = await call_claude(session, OPTIONS["claude_model"], CODE_PROMPT, CODE_TOOL, messages)
         code = block["input"].get("code", "")
         try:
             run = await run_lua(code)
@@ -334,67 +326,17 @@ async def code_animation(session: aiohttp.ClientSession, request_text: str, mode
     raise web.HTTPBadGateway(text=f"animation script failed twice: {last_error}")
 
 
-async def create(session: aiohttp.ClientSession, text: str, model: str = None) -> dict:
+async def create(session: aiohttp.ClientSession, text: str) -> dict:
     """Turns a request into {title, frames (768 bytes each), frame_ms, mode, code}.
 
     For mode "lua" the device gets the script itself; frames are only the relay's preview."""
     code_text = code_request(text)
     if code_text:
-        # Code mode is Claude-only; fall back to Sonnet if a Gemini model is configured
-        claude_model = model or OPTIONS["claude_model"]
-        if not claude_model.startswith("claude"):
-            claude_model = "claude-sonnet-5"
-        return await code_animation(session, code_text, claude_model)
-    drawing = await draw(session, text, model)
+        return await code_animation(session, code_text)
+    drawing = await draw(session, text)
     frames = to_frames(drawing)
     return {"title": drawing.get("title", ""), "frames": frames, "frame_ms": frame_ms(drawing),
             "mode": "frames" if len(frames) > 1 else "still", "code": None}
-
-
-# Gemini's response schema has no free-form maps, so the palette comes back as a list
-GEMINI_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "title": {"type": "STRING"},
-        "palette": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {"key": {"type": "STRING"}, "color": {"type": "STRING"}},
-                "required": ["key", "color"],
-            },
-        },
-        "frames": {"type": "ARRAY", "items": {"type": "ARRAY", "items": {"type": "STRING"}}},
-        "frame_ms": {"type": "INTEGER"},
-    },
-    "required": ["title", "palette", "frames"],
-}
-
-
-async def draw_gemini(session: aiohttp.ClientSession, prompt: str, model: str) -> dict:
-    payload = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT + (
-            "\n\nRespond with JSON: a short title, a palette list of {key, color} where key is one "
-            "character and color is hex like '#ff8800' (never use '.' as a key), frames: a list of 1-4 "
-            "frames where each frame is exactly 16 strings of exactly 16 characters, top row first, "
-            "using palette keys or '.' for unlit, and frame_ms for animations.")}]},
-        "contents": [{"role": "user", "parts": [{"text": f"Draw: {prompt}"}]}],
-        "generationConfig": {"responseMimeType": "application/json", "responseSchema": GEMINI_SCHEMA},
-    }
-    async with session.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        headers={"x-goog-api-key": OPTIONS.get("gemini_api_key", ""), "content-type": "application/json"},
-        json=payload,
-    ) as resp:
-        body = await resp.json(content_type=None)
-        if resp.status != 200:
-            raise web.HTTPBadGateway(text=f"Gemini request failed: {body}")
-    try:
-        data = json.loads(body["candidates"][0]["content"]["parts"][0]["text"])
-    except (KeyError, IndexError, json.JSONDecodeError):
-        raise web.HTTPBadGateway(text=f"Gemini did not return a drawing: {body}")
-    data["palette"] = {p["key"]: p["color"] for p in data.get("palette", []) if p.get("key")}
-    return data
 
 
 def hex_to_rgb(value: str) -> tuple:
@@ -408,7 +350,7 @@ def hex_to_rgb(value: str) -> tuple:
 
 
 def frame_list(drawing: dict) -> list:
-    frames = drawing.get("frames") or [drawing.get("rows", [])]
+    frames = drawing.get("frames") or []
     return [f for f in frames if isinstance(f, list)][:MAX_FRAMES] or [[]]
 
 
@@ -492,12 +434,10 @@ async def handle_draw_text(request: web.Request) -> web.Response:
     text = (await request.text()).strip()
     if not text:
         raise web.HTTPBadRequest(text="empty body")
-    # Optional model override for comparing models, e.g. ?model=claude-haiku-4-5-20251001
-    model = request.query.get("model")
-    result = await create(request.app["http"], text, model)
+    result = await create(request.app["http"], text)
     draw_seconds = time.monotonic() - started
-    log.info("drew %r (%s, %d frames) for %r with %s in %.1fs", result["title"], result["mode"],
-             len(result["frames"]), text, model or OPTIONS["claude_model"], draw_seconds)
+    log.info("drew %r (%s, %d frames) for %r in %.1fs", result["title"], result["mode"],
+             len(result["frames"]), text, draw_seconds)
     # ?preview=1 returns the relay's rendered frames even for Lua scripts (for test tools)
     return pixel_response(text, result, draw_seconds, preview=bool(request.query.get("preview")))
 
