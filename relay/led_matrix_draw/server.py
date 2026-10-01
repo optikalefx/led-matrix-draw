@@ -163,13 +163,16 @@ Always call the draw_pixel_art tool exactly once."""
 
 async def call_claude(session: aiohttp.ClientSession, model: str, system: str, tool: dict,
                       messages: list) -> dict:
-    """Forces one call of `tool` and returns that tool_use block."""
+    """Asks for one call of `tool` and returns that tool_use block.
+
+    Newer models (Sonnet 5.5, Opus 5.5) reject a forced tool_choice, so the
+    system prompt does the forcing and tool_choice stays on auto."""
     payload = {
         "model": model,
-        "max_tokens": 4000,
+        "max_tokens": 16000,
         "system": system,
         "tools": [tool],
-        "tool_choice": {"type": "tool", "name": tool["name"]},
+        "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
         "messages": messages,
     }
     async with session.post(

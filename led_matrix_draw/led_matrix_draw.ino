@@ -15,8 +15,8 @@
 #define BRIGHTNESS  40
 #define MAX_MILLIAMPS 500   // powered from USB; raise with a real 5V supply
 
-#define SAMPLE_RATE 16000
-#define MAX_SECONDS 5
+#define SAMPLE_RATE 8000                     // phone quality; lets 10s fit in RAM (no PSRAM)
+#define MAX_SECONDS 10
 #define MIN_SAMPLES (SAMPLE_RATE * 3 / 10)   // ignore presses shorter than 0.3s
 #define MIC_GAIN    16                       // 12-bit ADC -> 16-bit PCM
 #define DOUBLE_TAP_MS 500                    // two quick taps within this clear the panel
@@ -199,7 +199,7 @@ size_t recordWhileHeld() {
     while ((int32_t)(micros() - target) < 0) {}
 
     int raw = analogRead(MIC_PIN);
-    dc += ((raw << 8) - dc) >> 5;   // tracks DC and rumble below ~80Hz (panel refresh, hum), removed below
+    dc += ((raw << 8) - dc) >> 4;   // tracks DC and rumble below ~80Hz (panel refresh, hum), removed below
     uint32_t talk = talkAt;
     if (!talk || millis() - talk < REC_SETTLE_MS) continue;
     int32_t sample = (((raw << 8) - dc) >> 8) * MIC_GAIN;
