@@ -20,6 +20,10 @@
 #define MIN_SAMPLES (SAMPLE_RATE * 3 / 10)   // ignore presses shorter than 0.3s
 #define MIC_GAIN    16                       // 12-bit ADC -> 16-bit PCM
 #define DOUBLE_TAP_MS 500                    // two quick taps within this clear the panel
+#define REC_FRAME_MS  100                    // panel refresh while recording; slower = less mic noise
+#define REC_ORBIT_MS  2000                   // one lap of the recording dot
+#define REC_WAIT_MS   50                     // red dot while the switch-over click dies down; kids talk straight away, so keep it short
+#define REC_SETTLE_MS 30                     // audio kept from this long after the green ring is up
 
 #define MAX_FRAMES  4                        // hand-drawn animations; code animations run as Lua
 #define FRAME_BYTES (NUM_LEDS * 3)           // one frame: 16x16 RGB, row-major, top-left first
@@ -35,8 +39,8 @@ volatile int frameCount = 0;
 volatile uint16_t frameMs = 250;
 volatile uint32_t animStart = 0;
 volatile bool luaRunning = false;   // SHOWING a Lua script instead of stored frames
-volatile int micLevel = 0;
 volatile uint32_t errorUntil = 0;
+volatile uint32_t talkAt = 0;   // millis() when the green ring went up; 0 while still red
 
 uint8_t *audioBuf = nullptr;
 size_t audioCap = 0;
@@ -87,18 +91,25 @@ void drawPicture() {
       setXY(x, y, CRGB(px[(y * GRID + x) * 3], px[(y * GRID + x) * 3 + 1], px[(y * GRID + x) * 3 + 2]));
 }
 
-void drawRecording() {
-  for (int i = 0; i < 60; i++) {
-    int x, y;
-    borderXY(i, x, y);
-    setXY(x, y, CRGB(80, 0, 0));
+// A red dot first: switching away from the picture is a big jump in LED current, which
+// clicks in the mic, so that audio is thrown away. Then a dim green ring with one
+// brighter dot going round it, meaning "talk now". Refreshing the panel while the mic
+// is live puts ripple into the audio, so this updates slowly (REC_FRAME_MS) and only
+// a couple of LEDs change per frame. Returns true once the green ring is drawn.
+bool drawRecording(uint32_t ms) {
+  if (ms < REC_WAIT_MS) {
+    for (int y = 7; y <= 8; y++)
+      for (int x = 7; x <= 8; x++) setXY(x, y, CRGB(60, 0, 0));
+    return false;
   }
-  // Level meter rising from the bottom
-  int h = constrain(map(micLevel, 40, 1500, 0, 14), 0, 14);
-  for (int row = 0; row < h; row++) {
-    CRGB c = row < 8 ? CRGB::Green : row < 11 ? CRGB::Yellow : CRGB::Red;
-    for (int x = 4; x < 12; x++) setXY(x, 14 - row, c);
-  }
+  float a = (ms % REC_ORBIT_MS) * 2 * PI / REC_ORBIT_MS;
+  setXY(lroundf(7.5f + 6.0f * sinf(a)), lroundf(7.5f - 6.0f * cosf(a)), CRGB(0, 60, 0));
+  for (int y = 0; y < GRID; y++)
+    for (int x = 0; x < GRID; x++) {
+      float dx = x - 7.5f, dy = y - 7.5f;
+      if (!leds[xyToIndex(x, y)] && fabsf(sqrtf(dx * dx + dy * dy) - 6.0f) < 0.6f) setXY(x, y, CRGB(0, 12, 0));
+    }
+  return true;
 }
 
 // Comet that spirals from the outer ring to the center, then starts over
@@ -126,19 +137,30 @@ State restingState() {
 
 void displayTask(void *) {
   uint32_t frame = 0;
+  State shown = CONNECTING;
+  uint32_t recStart = 0, lastShow = 0;
   for (;;) {
-    FastLED.clear();
     State s = state;
+    if (s == RECORDING && shown == RECORDING && talkAt && millis() - lastShow < REC_FRAME_MS) {
+      vTaskDelay(pdMS_TO_TICKS(5));   // keep the mic quiet: refresh slowly while recording
+      continue;
+    }
+    if (s == RECORDING && shown != RECORDING) recStart = millis();
+    bool talk = false;
+    FastLED.clear();
     if (s == ERROR_SHOWN && millis() > errorUntil) state = s = restingState();
     switch (s) {
       case CONNECTING:  drawSpinner(frame, 160); break;   // blue
       case IDLE:        break;   // blank
       case SHOWING:     drawPicture(); break;
-      case RECORDING:   drawRecording(); break;
+      case RECORDING:   talk = drawRecording(millis() - recStart); break;
       case THINKING:    drawSpinner(frame, frame * 2); break;  // rainbow
       case ERROR_SHOWN: drawError(); break;
     }
     FastLED.show();
+    lastShow = millis();
+    if (talk && !talkAt) talkAt = lastShow;
+    shown = s;
     frame++;
     vTaskDelay(pdMS_TO_TICKS(20));   // ~50fps so fast animations play smoothly
   }
@@ -167,11 +189,12 @@ bool buttonHeld() {
   return digitalRead(BUTTON_PIN) == LOW;
 }
 
-// Records until the button has been released for 30ms or the buffer is full.
+// Records until the button has been released for 30ms or the buffer is full. Audio from
+// before the green "talk now" ring (plus REC_SETTLE_MS) is sampled but not kept.
 size_t recordWhileHeld() {
   size_t n = 0;
+  uint32_t taken = 0;
   int32_t dc = analogRead(MIC_PIN) << 8;   // running DC offset, 8 fractional bits
-  int lo = 4095, hi = 0;
   uint32_t releasedAt = 0;
   uint32_t start = micros();
 
@@ -183,26 +206,20 @@ size_t recordWhileHeld() {
       releasedAt = 0;
     }
 
-    uint32_t target = start + (uint32_t)((uint64_t)n * 1000000 / SAMPLE_RATE);
+    uint32_t target = start + (uint32_t)((uint64_t)taken++ * 1000000 / SAMPLE_RATE);
     while ((int32_t)(micros() - target) < 0) {}
 
     int raw = analogRead(MIC_PIN);
-    dc += ((raw << 8) - dc) >> 10;
+    dc += ((raw << 8) - dc) >> 5;   // tracks DC and rumble below ~80Hz (panel refresh, hum), removed below
+    uint32_t talk = talkAt;
+    if (!talk || millis() - talk < REC_SETTLE_MS) continue;
     int32_t sample = (((raw << 8) - dc) >> 8) * MIC_GAIN;
     audioBuf[n++] = linearToMulaw(sample);
-
-    lo = min(lo, raw);
-    hi = max(hi, raw);
-    if (n % 800 == 0) {
-      micLevel = hi - lo;
-      lo = 4095;
-      hi = 0;
-    }
   }
 
   float elapsed = (micros() - start) / 1e6;
-  Serial.printf("recorded %u samples in %.2fs (expected %.2fs)\n",
-                (unsigned)n, elapsed, (float)n / SAMPLE_RATE);
+  Serial.printf("recorded %u samples in %.2fs (expected %.2fs, %.2fs skipped)\n",
+                (unsigned)n, elapsed, (float)taken / SAMPLE_RATE, (float)(taken - n) / SAMPLE_RATE);
   return n;
 }
 
@@ -371,9 +388,9 @@ void loop() {
     return;
   }
 
+  talkAt = 0;
   state = RECORDING;
   size_t samples = recordWhileHeld();
-  micLevel = 0;
 
   // Too short to be speech: treat it as a tap. Two quick taps clear the panel.
   if (samples < MIN_SAMPLES) {
