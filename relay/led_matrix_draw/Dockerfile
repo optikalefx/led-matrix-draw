@@ -1,8 +1,8 @@
 FROM python:3.12-alpine
 
-RUN pip install --no-cache-dir aiohttp==3.12.15
+RUN apk add --no-cache lua5.4 && pip install --no-cache-dir aiohttp==3.12.15
 
 WORKDIR /app
-COPY server.py sandbox_runner.py ./
+COPY server.py lua_runner.lua ./
 
 CMD ["python", "-u", "server.py"]

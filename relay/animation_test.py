@@ -14,8 +14,7 @@ if len(sys.argv) > 2:  # custom prompts: animation_test.py OUT.html "prompt one"
 
 cards, ok = [], 0
 for prompt, expect in CASES:
-    req = urllib.request.Request(f"{RELAY}/draw_text", data=prompt.encode(), method="POST",
-                                 headers={"X-Max-Frames": "30"})
+    req = urllib.request.Request(f"{RELAY}/draw_text?preview=1", data=prompt.encode(), method="POST")
     with urllib.request.urlopen(req, timeout=120) as r:
         body = r.read()
         n, ms = int(r.headers.get("X-Frames", "1")), int(r.headers.get("X-Frame-Ms", "250"))

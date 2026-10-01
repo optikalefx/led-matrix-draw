@@ -1,7 +1,7 @@
 name: LED Matrix Draw
-version: "0.4.0"
+version: "0.6.1"
 slug: led_matrix_draw
-description: Relay for the ESP32 LED matrix - speech to text, then text to 16x16 pixel art
+description: Relay for the ESP32 LED matrix - speech to text, then Claude draws 16x16 pixel art or writes Lua animations
 arch:
   - aarch64
   - amd64
@@ -17,10 +17,8 @@ options:
   anthropic_api_key: ""
   stt_model: gpt-4o-mini-transcribe
   claude_model: claude-sonnet-5
-  gemini_api_key: ""
 schema:
   openai_api_key: password
   anthropic_api_key: password
   stt_model: str
   claude_model: str
-  gemini_api_key: password?
