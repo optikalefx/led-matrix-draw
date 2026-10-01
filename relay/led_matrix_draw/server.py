@@ -203,7 +203,14 @@ async def draw(session: aiohttp.ClientSession, prompt: str) -> dict:
 
 CODE_TRIGGER = re.compile(
     r"^\W*(?:please\s+)?(?:(?:can|could)\s+you\s+)?"
-    r"(?:write\s+(?:some\s+|me\s+)?code\s+(?:for|to|that)|code(?:\s+up)?)\b[\s,:.-]*",
+    r"(?:write\s+(?:some\s+|me\s+)?code(?:\s+(?:for|to|that|so|where|which|in\s+which))?"
+    r"|code(?:\s+up)?)\b[\s,:.-]*",
+    re.IGNORECASE)
+
+# Interactive requests need a Lua script even without "code": "a game where...",
+# "fireworks when I press the button"
+INTERACTIVE = re.compile(
+    r"\b(?:buttons?|(?:press|tap|click)(?:es|ed|ing)?|game(?!\s*(?:boy|controllers?|consoles?)\b))\b",
     re.IGNORECASE)
 
 
@@ -211,6 +218,8 @@ def code_request(text: str):
     """The request without its trigger phrase, or None when this isn't a code request."""
     m = CODE_TRIGGER.match(text)
     if not m:
+        if INTERACTIVE.search(text):
+            return text.strip(" .!?") or None
         return None
     rest = text[m.end():].strip(" .!?")
     rest = re.sub(r"^(?:draws?|makes?|shows?|animates?)\s+", "", rest, flags=re.IGNORECASE)

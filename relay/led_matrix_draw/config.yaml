@@ -1,5 +1,5 @@
 name: LED Matrix Draw
-version: "0.7.0"
+version: "0.7.1"
 slug: led_matrix_draw
 description: Relay for the ESP32 LED matrix - speech to text, then Claude draws 16x16 pixel art or writes Lua animations
 arch:

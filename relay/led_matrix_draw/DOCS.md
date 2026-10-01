@@ -19,7 +19,8 @@ Every response has `X-Transcript`, `X-Title` (URL-encoded) and `X-Mode`:
   row-major, top-left first), shown `X-Frame-Ms` apart. Claude animates (up to 4 hand-drawn
   frames) only when the request has an action word ("a cat running") or asks for an animation.
 - `lua` - body is a Lua 5.4 script defining `draw(t)`, which the ESP32 runs live. Requests that
-  start with "code ..." or "write code for ..." take this path. The relay test-runs the script
+  start with "code ..." or "write code ..." take this path, and so do requests that mention
+  the button, pressing, tapping, clicking or a game. The relay test-runs the script
   with `lua_runner.lua` first (same drawing API and limits as the device) and asks Claude to fix
   it once if it fails. Scripts that ask for the button define `press(t)` / `release(t)` and can
   read `button()`; the preview simulates one press at 1s so those handlers get tested too.
