@@ -191,7 +191,7 @@ bool luaAnimLoad(const char *source, size_t length, String &error) {
   luaL_requiref(L, LUA_STRLIBNAME, luaopen_string, 1);
   luaL_requiref(L, LUA_TABLIBNAME, luaopen_table, 1);
   lua_settop(L, 0);
-  for (const char *name : {"dofile", "loadfile", "load", "require", "collectgarbage", "print"}) {
+  for (const char *name : {"dofile", "loadfile", "load", "require", "collectgarbage"}) {
     lua_pushnil(L);
     lua_setglobal(L, name);
   }

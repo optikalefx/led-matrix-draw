@@ -156,7 +156,9 @@ Animation rules:
 - The frames play in a loop, so the last frame must lead naturally back into the first.
 - Keep the composition, size and palette the same across frames; change only the parts that move.
 - Prefer small movements of 1-2 pixels per frame; big jumps look like flicker at this size.
-- frame_ms: usually 150-300 for lively motion, 300-500 for gentle motion like swaying or breathing."""
+- frame_ms: usually 150-300 for lively motion, 300-500 for gentle motion like swaying or breathing.
+
+Always call the draw_pixel_art tool exactly once."""
 
 
 async def call_claude(session: aiohttp.ClientSession, model: str, system: str, tool: dict,
@@ -189,9 +191,8 @@ async def call_claude(session: aiohttp.ClientSession, model: str, system: str, t
 
 
 async def draw(session: aiohttp.ClientSession, prompt: str) -> dict:
-    block = await call_claude(session, OPTIONS["claude_model"],
-                              SYSTEM_PROMPT + "\n- Always call the draw_pixel_art tool exactly once.",
-                              DRAW_TOOL, [{"role": "user", "content": f"Draw: {prompt}"}])
+    block = await call_claude(session, OPTIONS["claude_model"], SYSTEM_PROMPT, DRAW_TOOL,
+                              [{"role": "user", "content": f"Draw: {prompt}"}])
     return block["input"]
 
 
@@ -407,18 +408,17 @@ async def handle_draw(request: web.Request) -> web.Response:
     if not data:
         raise web.HTTPBadRequest(text="empty body")
 
+    rate = int(request.headers.get("X-Sample-Rate", "16000"))
     if request.content_type in ("audio/wav", "audio/x-wav"):
         wav = data
     else:
-        rate = int(request.headers.get("X-Sample-Rate", "16000"))
         wav = mulaw_to_wav(data, rate)
 
     LAST["wav"] = wav
     session = request.app["http"]
     transcript = await transcribe(session, wav)
     stt_done = time.monotonic()
-    log.info("heard (%.1fs audio, %.1fs): %r", len(data) / int(request.headers.get("X-Sample-Rate", "16000")),
-             stt_done - started, transcript)
+    log.info("heard (%.1fs audio, %.1fs): %r", len(data) / rate, stt_done - started, transcript)
     if not transcript:
         raise web.HTTPUnprocessableEntity(text="no speech detected")
 

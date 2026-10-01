@@ -22,7 +22,7 @@
 #define DOUBLE_TAP_MS 500                    // two quick taps within this clear the panel
 #define REC_FRAME_MS  100                    // panel refresh while recording; slower = less mic noise
 #define REC_ORBIT_MS  2000                   // one lap of the recording dot
-#define REC_WAIT_MS   50                     // red dot while the switch-over click dies down; kids talk straight away, so keep it short
+#define REC_WAIT_MS   50                     // red dot shown while the switch-over click dies down
 #define REC_SETTLE_MS 30                     // audio kept from this long after the green ring is up
 
 #define MAX_FRAMES  4                        // hand-drawn animations; code animations run as Lua
@@ -50,15 +50,6 @@ uint32_t lastTapAt = 0;
 uint8_t spiralX[NUM_LEDS], spiralY[NUM_LEDS];
 
 // ---------- display (runs on core 0) ----------
-
-// Position i (0..59) clockwise around the outer edge
-void borderXY(int i, int &x, int &y) {
-  i %= 60;
-  if (i < 15)      { x = i;           y = 0; }
-  else if (i < 30) { x = 15;          y = i - 15; }
-  else if (i < 45) { x = 45 - i;      y = 15; }
-  else             { x = 0;           y = 60 - i; }
-}
 
 void buildSpiral() {
   int i = 0;
@@ -91,11 +82,9 @@ void drawPicture() {
       setXY(x, y, CRGB(px[(y * GRID + x) * 3], px[(y * GRID + x) * 3 + 1], px[(y * GRID + x) * 3 + 2]));
 }
 
-// A red dot first: switching away from the picture is a big jump in LED current, which
-// clicks in the mic, so that audio is thrown away. Then a dim green ring with one
-// brighter dot going round it, meaning "talk now". Refreshing the panel while the mic
-// is live puts ripple into the audio, so this updates slowly (REC_FRAME_MS) and only
-// a couple of LEDs change per frame. Returns true once the green ring is drawn.
+// Red center dot for the first REC_WAIT_MS (the LED current change clicks in the mic),
+// then a dim green ring with a brighter dot orbiting it, meaning "talk now". Few LEDs
+// change per frame to keep panel ripple out of the audio. Returns true once the ring is up.
 bool drawRecording(uint32_t ms) {
   if (ms < REC_WAIT_MS) {
     for (int y = 7; y <= 8; y++)

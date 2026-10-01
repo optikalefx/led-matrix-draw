@@ -4,7 +4,7 @@
 -- Prints one JSON object: {"frames": "<hex>", "fps": n, "max_instructions": n, "memory_kb": n}
 -- or {"error": "..."}.
 --
--- The drawing API mirrors led_matrix_draw.ino exactly: colors are 0xRRGGBB integers,
+-- The drawing API mirrors lua_anim.cpp on the ESP32: colors are 0xRRGGBB integers,
 -- coordinates are rounded to the nearest pixel, off-canvas writes are ignored.
 
 local GRID = 16
@@ -13,7 +13,7 @@ local SETUP_BUDGET = 1500000    -- top-level code runs once; the ESP32 allows 30
 local MEMORY_LIMIT_KB = 48      -- the ESP32 allows 64 KB
 
 local nframes = tonumber(arg[1]) or 60
-local default_fps = tonumber(arg[2]) or 30
+local fps = tonumber(arg[2]) or 30
 local src = io.read("a")
 
 local px = {}
@@ -181,8 +181,6 @@ end
 local ok, e = run(chunk)
 if not ok then fail(e) end
 if type(env.draw) ~= "function" then fail("the script must define draw(t)") end
-
-local fps = default_fps
 
 local worst = 0
 budget, phase = FRAME_BUDGET, "one draw() call"
