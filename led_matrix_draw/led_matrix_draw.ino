@@ -1,5 +1,7 @@
 // Push-to-talk pixel art: hold the button, speak, release.
 // Audio goes to the relay add-on (speech to text + Claude), which returns 16x16 RGB pixels.
+// While a picture is showing the button belongs to it: presses go to its Lua script, and
+// holding for HOLD_CLEAR_MS clears it so the next hold records again.
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -19,7 +21,8 @@
 #define MAX_SECONDS 10
 #define MIN_SAMPLES (SAMPLE_RATE * 3 / 10)   // ignore presses shorter than 0.3s
 #define MIC_GAIN    16                       // 12-bit ADC -> 16-bit PCM
-#define DOUBLE_TAP_MS 500                    // two quick taps within this clear the panel
+#define HOLD_CLEAR_MS 800                    // holding this long while a picture shows clears it
+#define DEBOUNCE_MS   30                     // the button counts as released after this long up
 #define REC_FRAME_MS  100                    // panel refresh while recording; slower = less mic noise
 #define REC_ORBIT_MS  2000                   // one lap of the recording dot
 #define REC_WAIT_MS   50                     // red dot shown while the switch-over click dies down
@@ -42,9 +45,14 @@ volatile bool luaRunning = false;   // SHOWING a Lua script instead of stored fr
 volatile uint32_t errorUntil = 0;
 volatile uint32_t talkAt = 0;   // millis() when the green ring went up; 0 while still red
 
+// Button events while a picture shows, counted by loop() and delivered to the Lua script by the
+// display task. Presses and releases alternate, so the counts say what order they came in.
+volatile uint32_t presses = 0, releases = 0;
+volatile bool pressed = false;
+uint32_t pressesSeen = 0, releasesSeen = 0;
+
 uint8_t *audioBuf = nullptr;
 size_t audioCap = 0;
-uint32_t lastTapAt = 0;
 
 // Clockwise path around each ring, outermost first, ending at the center
 uint8_t spiralX[NUM_LEDS], spiralY[NUM_LEDS];
@@ -66,8 +74,22 @@ void showError();
 
 void drawPicture() {
   if (luaRunning) {
+    float t = (millis() - animStart) / 1000.0f;
     String error;
-    if (!luaAnimDraw((millis() - animStart) / 1000.0f, error)) {
+    bool ok = true;
+    for (;;) {
+      if (pressesSeen == releasesSeen && presses != pressesSeen) {
+        pressesSeen++;
+        ok = luaAnimEvent("press", t, error);
+      } else if (pressesSeen != releasesSeen && releases != releasesSeen) {
+        releasesSeen++;
+        ok = luaAnimEvent("release", t, error);
+      } else {
+        break;
+      }
+      if (!ok) break;
+    }
+    if (!ok || !luaAnimDraw(t, pressed, error)) {
       Serial.printf("lua %s\n", error.c_str());
       luaRunning = false;
       hasPicture = false;
@@ -190,7 +212,7 @@ size_t recordWhileHeld() {
   while (n < audioCap) {
     if (!buttonHeld()) {
       if (releasedAt == 0) releasedAt = micros();
-      else if (micros() - releasedAt > 30000) break;
+      else if (micros() - releasedAt > DEBOUNCE_MS * 1000) break;
     } else {
       releasedAt = 0;
     }
@@ -258,6 +280,8 @@ bool loadLuaResponse(HTTPClient &http) {
   }
   Serial.printf("lua script running: %d bytes, %u bytes of Lua memory\n", length,
                 (unsigned)luaAnimMemoryUsed());
+  pressesSeen = presses;   // the button is up, so these are equal: no stale events
+  releasesSeen = releases;
   animStart = millis();
   luaRunning = true;
   hasPicture = true;
@@ -325,6 +349,32 @@ bool sendToRelay(size_t samples) {
 
 // ---------- main ----------
 
+void clearPicture() {
+  hasPicture = false;
+  luaRunning = false;
+  state = IDLE;
+  delay(50);   // let the display task finish any frame it was drawing
+  luaAnimClose();
+  Serial.println("hold: cleared");
+}
+
+// The button went down while a picture is showing: report the press and release to its
+// script, and clear the picture if the button is held for HOLD_CLEAR_MS.
+void pictureButton() {
+  uint32_t downAt = millis(), releasedAt = 0;
+  pressed = true;
+  presses++;
+  for (;;) {
+    if (buttonHeld()) releasedAt = 0;
+    else if (!releasedAt) releasedAt = millis();
+    else if (millis() - releasedAt > DEBOUNCE_MS) break;
+    if (hasPicture && !releasedAt && millis() - downAt >= HOLD_CLEAR_MS) clearPicture();
+    delay(2);
+  }
+  pressed = false;
+  releases++;
+}
+
 void connectWiFi() {
   state = CONNECTING;
   WiFi.mode(WIFI_STA);
@@ -373,7 +423,12 @@ void loop() {
   if (state == CONNECTING) state = restingState();
 
   if (!buttonHeld()) {
-    delay(10);
+    delay(5);
+    return;
+  }
+
+  if (hasPicture) {
+    pictureButton();
     return;
   }
 
@@ -381,23 +436,11 @@ void loop() {
   state = RECORDING;
   size_t samples = recordWhileHeld();
 
-  // Too short to be speech: treat it as a tap. Two quick taps clear the panel.
+  // Too short to be speech: ignore it
   if (samples < MIN_SAMPLES) {
-    if (lastTapAt && millis() - lastTapAt < DOUBLE_TAP_MS) {
-      hasPicture = false;
-      luaRunning = false;
-      state = IDLE;
-      delay(50);   // let the display task finish any frame it was drawing
-      luaAnimClose();
-      lastTapAt = 0;
-      Serial.println("double tap: cleared");
-    } else {
-      lastTapAt = millis();
-    }
     state = restingState();
     return;
   }
-  lastTapAt = 0;
 
   state = THINKING;
   if (sendToRelay(samples)) state = SHOWING;

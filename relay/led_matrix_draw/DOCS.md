@@ -21,7 +21,14 @@ Every response has `X-Transcript`, `X-Title` (URL-encoded) and `X-Mode`:
 - `lua` - body is a Lua 5.4 script defining `draw(t)`, which the ESP32 runs live. Requests that
   start with "code ..." or "write code for ..." take this path. The relay test-runs the script
   with `lua_runner.lua` first (same drawing API and limits as the device) and asks Claude to fix
-  it once if it fails.
+  it once if it fails. Scripts that ask for the button define `press(t)` / `release(t)` and can
+  read `button()`; the preview simulates one press at 1s so those handlers get tested too.
+
+## Button on the device
+
+- Nothing showing: hold to talk, release to send.
+- A picture showing: presses go to its Lua script (if it has handlers); holding for 0.8s clears
+  the picture, and the button goes back to push-to-talk.
 
 ## Options
 

@@ -10,6 +10,7 @@ static lua_State *L = nullptr;
 static size_t luaBytes = 0;
 static uint32_t instructions = 0;
 static uint32_t budget = LUA_FRAME_BUDGET;
+static bool buttonDown = false;
 
 // ---------- sandbox ----------
 
@@ -162,6 +163,11 @@ static int l_sprite(lua_State *L) {
   return 0;
 }
 
+static int l_button(lua_State *L) {
+  lua_pushboolean(L, buttonDown);
+  return 1;
+}
+
 // ---------- lifecycle ----------
 
 static bool check(int status, const char *what, String &error) {
@@ -200,7 +206,7 @@ bool luaAnimLoad(const char *source, size_t length, String &error) {
   const luaL_Reg api[] = {
     {"rgb", l_rgb}, {"hsv", l_hsv}, {"blend", l_blend}, {"set", l_set}, {"get", l_get},
     {"fill", l_fill}, {"rect", l_rect}, {"line", l_line}, {"circle", l_circle},
-    {"sprite", l_sprite}, {nullptr, nullptr},
+    {"sprite", l_sprite}, {"button", l_button}, {nullptr, nullptr},
   };
   for (const luaL_Reg *f = api; f->name; f++) lua_register(L, f->name, f->func);
   lua_pushinteger(L, GRID);
@@ -229,11 +235,26 @@ bool luaAnimLoad(const char *source, size_t length, String &error) {
   return true;
 }
 
-bool luaAnimDraw(float t, String &error) {
+bool luaAnimEvent(const char *name, float t, String &error) {
+  if (!L) return true;
+  lua_getglobal(L, name);
+  if (!lua_isfunction(L, -1)) {
+    lua_pop(L, 1);
+    return true;
+  }
+  buttonDown = strcmp(name, "press") == 0;
+  instructions = 0;
+  budget = LUA_FRAME_BUDGET;
+  lua_pushnumber(L, t);
+  return check(lua_pcall(L, 1, 0, 0), name, error);
+}
+
+bool luaAnimDraw(float t, bool held, String &error) {
   if (!L) {
     error = "no script loaded";
     return false;
   }
+  buttonDown = held;
   FastLED.clear();
   instructions = 0;
   budget = LUA_FRAME_BUDGET;

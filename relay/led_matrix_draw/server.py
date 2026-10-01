@@ -225,7 +225,8 @@ CODE_TOOL = {
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "Short name of the animation."},
-            "code": {"type": "string", "description": "Lua source defining draw(t)."},
+            "code": {"type": "string", "description": "Lua source defining draw(t), and press(t) / "
+                                                    "release(t) if it uses the button."},
         },
         "required": ["title", "code"],
     },
@@ -261,6 +262,20 @@ Environment:
   2 billion or rely on high float precision.
 - Stay small and fast: under ~40 KB of data (a few hundred numbers; prefer flat arrays over many
   small tables) and a few hundred drawing calls per frame at most.
+
+The button (optional): the device has one push button. Only when the request mentions the button,
+pressing, tapping, clicking, a game, or controlling something, define either or both of:
+
+    function press(t)     -- the button went down
+    function release(t)   -- the button came back up
+
+- t is the same clock draw(t) gets. Handlers run just before the next draw(t); keep them short:
+  change state there (start a jump, spawn a burst, switch a color), and draw only in draw(t).
+- button() returns true while the button is held, for things like charging up or holding thrust.
+- Holding the button for about 1 second exits the animation, so design for taps and short holds.
+- Games: keep them simple and one-button (flap, jump, shoot, change lane), show the score
+  with a few pixels, and restart with a press after losing.
+- Otherwise don't define press or release; the animation just plays.
 
 Characters and objects vs effects:
 - For a character or object (cat, bird, person, rocket, heart...), hand-draw it as pixel-art

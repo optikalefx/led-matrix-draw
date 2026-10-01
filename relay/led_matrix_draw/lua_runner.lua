@@ -6,11 +6,14 @@
 --
 -- The drawing API mirrors lua_anim.cpp on the ESP32: colors are 0xRRGGBB integers,
 -- coordinates are rounded to the nearest pixel, off-canvas writes are ignored.
+-- Scripts with press(t)/release(t) handlers get a simulated button press during the preview.
 
 local GRID = 16
 local FRAME_BUDGET = 150000     -- VM instructions per draw(); the ESP32 allows 300000
 local SETUP_BUDGET = 1500000    -- top-level code runs once; the ESP32 allows 3000000
 local MEMORY_LIMIT_KB = 48      -- the ESP32 allows 64 KB
+
+local PRESS_AT, RELEASE_AT = 1.0, 1.3   -- seconds into the preview
 
 local nframes = tonumber(arg[1]) or 60
 local fps = tonumber(arg[2]) or 30
@@ -37,6 +40,7 @@ local function put(x, y, c)
 end
 
 local api = {}
+local held = false
 
 function api.rgb(r, g, b)
   local function ch(v) return math.max(0, math.min(255, math.floor(v))) end
@@ -120,6 +124,8 @@ function api.sprite(rows, palette, x, y, flip)
   end
 end
 
+function api.button() return held end
+
 -- Sandbox: same globals the ESP32 exposes (base + math + string + table, no file/code loading)
 local env = {
   WIDTH = GRID, HEIGHT = GRID,
@@ -184,9 +190,24 @@ if type(env.draw) ~= "function" then fail("the script must define draw(t)") end
 
 local worst = 0
 budget, phase = FRAME_BUDGET, "one draw() call"
+local pressed, released = false, false
+local function event(name, t)
+  held = name == "press"
+  local f = env[name]
+  if f == nil then return end
+  if type(f) ~= "function" then fail(name .. " must be a function") end
+  phase = "one " .. name .. "() call"
+  ok, e = run(f, t)
+  if not ok then fail(e) end
+  worst = math.max(worst, instructions)
+  phase = "one draw() call"
+end
 for i = 0, nframes - 1 do
+  local t = i / fps
+  if not pressed and t >= PRESS_AT then pressed = true; event("press", t) end
+  if not released and t >= RELEASE_AT then released = true; event("release", t) end
   clear()
-  ok, e = run(env.draw, i / fps)
+  ok, e = run(env.draw, t)
   if not ok then fail(e) end
   worst = math.max(worst, instructions)
   local base = i * GRID * GRID
