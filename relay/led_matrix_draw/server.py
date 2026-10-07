@@ -1,7 +1,9 @@
 """HTTP relay: ESP32 audio -> OpenAI speech to text -> Claude -> 16x16 RGB pixels."""
 
 import asyncio
+import hashlib
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -24,6 +26,9 @@ LUA_RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lua_runne
 LUA_BIN = os.environ.get("LUA_BIN", "lua5.4")
 PREVIEW_SECONDS = 4   # how much of a Lua animation the preview page shows
 PREVIEW_FPS = 30
+# /data survives add-on restarts and updates
+CACHE_DIR = os.environ.get("CACHE_DIR") or ("/data/cache" if os.path.isdir("/data") else "cache")
+DEVICE_PATH = os.path.join(os.path.dirname(CACHE_DIR), "device.json")   # the ESP32's IP, for Send
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("led_matrix_draw")
@@ -355,16 +360,108 @@ async def code_animation(session: aiohttp.ClientSession, request_text: str) -> d
 
 
 async def create(session: aiohttp.ClientSession, text: str) -> dict:
-    """Turns a request into {title, frames (768 bytes each), frame_ms, mode, code}.
+    """Turns a request into {title, frames (768 bytes each), frame_ms, mode, code, cached}.
 
-    For mode "lua" the device gets the script itself; frames are only the relay's preview."""
+    For mode "lua" the device gets the script itself; frames are only the relay's preview.
+    A phrase that was drawn before comes back from the cache, unless it starts with
+    "another", "different" or "redraw", which draws it again and replaces the cached one."""
+    text, fresh = strip_fresh(text)
     code_text = code_request(text)
+    phrase = normalize(code_text or text)
+    key = cache_key("lua" if code_text else "draw", phrase)
+    if not fresh:
+        result = cache_get(key)
+        if result:
+            return result
     if code_text:
-        return await code_animation(session, code_text)
-    drawing = await draw(session, text)
-    frames = to_frames(drawing)
-    return {"title": drawing.get("title", ""), "frames": frames, "frame_ms": frame_ms(drawing),
-            "mode": "frames" if len(frames) > 1 else "still", "code": None}
+        result = await code_animation(session, code_text)
+    else:
+        drawing = await draw(session, text)
+        frames = to_frames(drawing)
+        result = {"title": drawing.get("title", ""), "frames": frames, "frame_ms": frame_ms(drawing),
+                  "mode": "frames" if len(frames) > 1 else "still", "code": None}
+    cache_put(key, phrase, result)
+    return {**result, "cached": False}
+
+
+# ---------- cache: the same phrase shows the same picture without asking Claude again ----------
+
+FRESH = re.compile(r"^\W*(?:(?:draw|make|show)\s+(?:me\s+)?)?(?:an?\s+)?(?:another|different)\b\s*"
+                   r"|^\W*redraw\b\s*", re.IGNORECASE)
+FILLER = re.compile(r"^(?:please|can you|could you|draw|make|show|me|a|an|the|some)\s+")
+
+
+def strip_fresh(text: str) -> tuple:
+    """("cat", True) for "another cat" / "a different cat" / "redraw a cat"; the text unchanged and False otherwise."""
+    m = FRESH.match(text)
+    if not m or not text[m.end():].strip(" .!?"):
+        return text, False
+    return text[m.end():], True
+
+
+def normalize(text: str) -> str:
+    """"Draw me a red heart!" and "a red heart" -> "red heart"."""
+    text = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    while True:
+        shorter = FILLER.sub("", text)
+        if shorter == text:
+            return text
+        text = shorter
+
+
+def cache_key(kind: str, phrase: str) -> str:
+    # The model is part of the key so switching models draws everything fresh
+    return hashlib.sha1(f"{OPTIONS['claude_model']}|{kind}|{phrase}".encode()).hexdigest()
+
+
+def cache_path(key: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", key):
+        raise web.HTTPNotFound(text="no such cache entry")
+    return os.path.join(CACHE_DIR, key + ".json")
+
+
+def cache_get(key: str):
+    try:
+        with open(cache_path(key)) as f:
+            entry = json.load(f)
+        return {**entry, "frames": [bytes.fromhex(f) for f in entry["frames"]], "cached": True}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError) as e:
+        log.warning("ignoring bad cache entry %s: %s", key, e)
+        return None
+
+
+def cache_put(key: str, phrase: str, result: dict):
+    entry = {**result, "frames": [f.hex() for f in result["frames"]], "phrase": phrase,
+             "model": OPTIONS["claude_model"], "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    entry.pop("cached", None)
+    path = cache_path(key)
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump(entry, f)
+        os.replace(path + ".tmp", path)
+    except OSError as e:
+        log.warning("could not cache %r: %s", result.get("title"), e)
+
+
+def cache_list() -> list:
+    """Every cache entry as stored (frames still hex), newest first, each with its "key"."""
+    entries = []
+    try:
+        names = os.listdir(CACHE_DIR)
+    except FileNotFoundError:
+        return []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(CACHE_DIR, name)) as f:
+                entries.append({**json.load(f), "key": name[:-5]})
+        except (OSError, ValueError) as e:
+            log.warning("ignoring bad cache entry %s: %s", name, e)
+    return sorted(entries, key=lambda e: e.get("saved_at", ""), reverse=True)
 
 
 def hex_to_rgb(value: str) -> tuple:
@@ -411,6 +508,34 @@ def to_frames(drawing: dict) -> list:
 LAST = {"transcript": None, "result": None, "at": None, "wav": None}
 
 
+def load_device() -> dict:
+    try:
+        with open(DEVICE_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"ip": None}
+
+
+DEVICE = load_device()
+
+
+def remember_device(ip: str):
+    """The ESP32 says where it is at boot (POST /hello) and with every recording."""
+    try:
+        ip = str(ipaddress.ip_address(ip.strip()))
+    except ValueError:
+        return
+    if ip == DEVICE.get("ip"):
+        return
+    DEVICE["ip"] = ip
+    log.info("device is at %s", ip)
+    try:
+        with open(DEVICE_PATH, "w") as f:
+            json.dump(DEVICE, f)
+    except OSError as e:
+        log.warning("could not save the device address: %s", e)
+
+
 def pixel_response(transcript: str, result: dict, draw_seconds: float,
                    preview: bool = False) -> web.Response:
     LAST.update(transcript=transcript, result=result, at=time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -419,6 +544,7 @@ def pixel_response(transcript: str, result: dict, draw_seconds: float,
         "X-Title": urllib.parse.quote(result["title"]),
         "X-Mode": result["mode"],
         "X-Draw-Seconds": f"{draw_seconds:.2f}",
+        "X-Cached": "1" if result.get("cached") else "0",
     }
     if result["mode"] == "lua" and not preview:
         # The device runs the script itself
@@ -442,6 +568,8 @@ async def handle_draw(request: web.Request) -> web.Response:
         wav = mulaw_to_wav(data, rate)
 
     LAST["wav"] = wav
+    if request.headers.get("X-Device-IP"):
+        remember_device(request.headers["X-Device-IP"])
     session = request.app["http"]
     transcript = await transcribe(session, wav)
     stt_done = time.monotonic()
@@ -451,8 +579,9 @@ async def handle_draw(request: web.Request) -> web.Response:
 
     result = await create(session, transcript)
     draw_seconds = time.monotonic() - stt_done
-    log.info("drew %r (%s, %d frames) in %.1fs (total %.1fs)", result["title"], result["mode"],
-             len(result["frames"]), draw_seconds, time.monotonic() - started)
+    log.info("%s %r (%s, %d frames) in %.1fs (total %.1fs)", "cached" if result["cached"] else "drew",
+             result["title"], result["mode"], len(result["frames"]), draw_seconds,
+             time.monotonic() - started)
     return pixel_response(transcript, result, draw_seconds)
 
 
@@ -463,8 +592,8 @@ async def handle_draw_text(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="empty body")
     result = await create(request.app["http"], text)
     draw_seconds = time.monotonic() - started
-    log.info("drew %r (%s, %d frames) for %r in %.1fs", result["title"], result["mode"],
-             len(result["frames"]), text, draw_seconds)
+    log.info("%s %r (%s, %d frames) for %r in %.1fs", "cached" if result["cached"] else "drew",
+             result["title"], result["mode"], len(result["frames"]), text, draw_seconds)
     # ?preview=1 returns the relay's rendered frames even for Lua scripts (for test tools)
     return pixel_response(text, result, draw_seconds, preview=bool(request.query.get("preview")))
 
@@ -486,27 +615,126 @@ async def handle_index(request: web.Request) -> web.Response:
         frames_js = json.dumps([[f"rgb({f[i*3]},{f[i*3+1]},{f[i*3+2]})" for i in range(GRID * GRID)]
                                 for f in frames])
         delay = result["frame_ms"]
-        title = f"{result['title']} ({result['mode']}, {len(frames)} frame{'s' if len(frames) != 1 else ''})"
+        title = (f"{result['title']} ({result['mode']}, {len(frames)} frame{'s' if len(frames) != 1 else ''}"
+                 f"{', from cache' if result.get('cached') else ''})")
         if result.get("code"):
             code_html = f"<h2>Code</h2><pre>{html_escape(result['code'])}</pre>"
+    saved = cache_list()
+    saved_js = json.dumps({e["key"]: thumbnail(e) for e in saved})
+    saved_html = "".join(f"""<div class="card" data-key="{e['key']}">
+<canvas width="16" height="16" data-key="{e['key']}"></canvas>
+<b>{html_escape(e.get('phrase', ''))}</b>{html_escape(e.get('title', ''))}
+<small>{e.get('mode', '')} · {html_escape(e.get('model', ''))} · {e.get('saved_at', '')}</small>
+{f"<details><summary>Code</summary><pre>{html_escape(e['code'])}</pre></details>" if e.get('code') else ''}
+<button class="send">Send</button> <button class="delete">Delete</button></div>""" for e in saved)
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>LED Matrix Draw</title>
 <style>body{{background:#111;color:#ddd;font-family:system-ui;padding:16px}}
 pre{{background:#1b1b1f;padding:12px;border-radius:8px;overflow-x:auto;font-size:13px}}
-.grid{{display:grid;grid-template-columns:repeat(16,18px);gap:2px}}.grid div{{width:18px;height:18px;border-radius:50%}}</style>
+.grid{{display:grid;grid-template-columns:repeat(16,18px);gap:2px}}.grid div{{width:18px;height:18px;border-radius:50%}}
+.saved{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}}
+.card{{background:#1b1b1f;border-radius:8px;padding:10px;font-size:13px}}
+.card canvas{{width:96px;height:96px;image-rendering:pixelated;background:#000;display:block;margin-bottom:6px}}
+.card b{{display:block;font-size:14px;color:#fff}}.card small{{color:#888;display:block}}
+.card button{{margin-top:6px;border:0;border-radius:6px;padding:4px 10px;cursor:pointer}}
+.card .send{{background:#1d2f3a;color:#9cf}}.card .delete{{background:#3a1d1d;color:#f99}}
+.card details pre{{max-height:240px;font-size:11px}}</style>
 </head><body><h1>LED Matrix Draw</h1>
 <p>Last prompt: {LAST['transcript'] or '(none yet)'} {('at ' + LAST['at']) if LAST['at'] else ''}</p>
 <p>{title}</p>
 <div class="grid" id="grid"></div>
-{'<p><audio controls src="/last.wav"></audio></p>' if LAST['wav'] else ''}
+{'<p><audio controls src="last.wav"></audio></p>' if LAST['wav'] else ''}
 {code_html}
+<h2>Saved ({len(saved)})</h2>
+<p><small>Saying a saved phrase again shows it without asking Claude. Start with "another",
+"a different" or "redraw" ("another cat") to draw it again.</small></p>
+<div class="saved" id="saved">{saved_html or '<p>Nothing saved yet.</p>'}</div>
 <script>
 const frames = {frames_js}, grid = document.getElementById("grid");
 const cells = Array.from({{length: 256}}, () => grid.appendChild(document.createElement("div")));
 let n = 0;
 function show() {{ if (!frames.length) return; frames[n % frames.length].forEach((c, i) => cells[i].style.background = c); n++; }}
 show(); if (frames.length > 1) setInterval(show, {delay});
+
+const saved = {saved_js};
+document.querySelectorAll(".card canvas").forEach(canvas => {{
+  const s = saved[canvas.dataset.key], ctx = canvas.getContext("2d"), img = ctx.createImageData(16, 16);
+  let n = 0;
+  function paint() {{
+    const hex = s.frames[n++ % s.frames.length];
+    for (let i = 0; i < 256; i++) {{
+      for (let c = 0; c < 3; c++) img.data[i * 4 + c] = parseInt(hex.substr((i * 3 + c) * 2, 2), 16);
+      img.data[i * 4 + 3] = 255;
+    }}
+    ctx.putImageData(img, 0, 0);
+  }}
+  paint(); if (s.frames.length > 1) setInterval(paint, s.frame_ms);
+}});
+document.querySelectorAll(".card .send").forEach(btn => btn.onclick = async () => {{
+  btn.disabled = true; btn.textContent = "Sending...";
+  const resp = await fetch(`cache/${{btn.closest(".card").dataset.key}}/send`, {{method: "POST"}});
+  btn.textContent = resp.ok ? "Sent" : "Send"; btn.disabled = false;
+  if (!resp.ok) alert(await resp.text());
+  else setTimeout(() => btn.textContent = "Send", 2000);
+}});
+document.querySelectorAll(".card .delete").forEach(btn => btn.onclick = async () => {{
+  const card = btn.closest(".card");
+  if (!confirm(`Delete "${{card.querySelector("b").textContent}}"?`)) return;
+  const resp = await fetch(`cache/${{card.dataset.key}}`, {{method: "DELETE"}});
+  if (resp.ok) card.remove(); else alert(await resp.text());
+}});
 </script></body></html>"""
     return web.Response(text=html, content_type="text/html")
+
+
+def thumbnail(entry: dict) -> dict:
+    """At most 30 frames for the page; long Lua previews are sampled and slowed to match."""
+    frames = entry.get("frames") or ["00" * GRID * GRID * 3]
+    step = -(-len(frames) // 30)
+    return {"frames": frames[::step], "frame_ms": entry.get("frame_ms", 250) * step}
+
+
+async def handle_hello(request: web.Request) -> web.Response:
+    remember_device(await request.text())
+    return web.Response(text="hello")
+
+
+async def handle_cache_device(request: web.Request) -> web.Response:
+    """A saved entry in the same format /draw returns; the device fetches it after a Send."""
+    result = cache_get(request.match_info["key"])
+    if not result:
+        raise web.HTTPNotFound(text="no such cache entry")
+    log.info("sending saved %r to the device", result.get("phrase"))
+    return pixel_response(result.get("phrase", ""), result, 0)
+
+
+async def handle_cache_send(request: web.Request) -> web.Response:
+    """Tells the device to show a saved entry; it then fetches /cache/{key}/device itself."""
+    key = request.match_info["key"]
+    if not os.path.exists(cache_path(key)):
+        raise web.HTTPNotFound(text="no such cache entry")
+    ip = DEVICE.get("ip")
+    if not ip:
+        raise web.HTTPConflict(text="The device hasn't checked in yet. Restart it, or talk to it once.")
+    try:
+        async with request.app["http"].post(f"http://{ip}/show", data=key,
+                                            timeout=aiohttp.ClientTimeout(total=4)) as resp:
+            if resp.status != 200:
+                raise web.HTTPBadGateway(text=f"The device said: {await resp.text()}")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        raise web.HTTPBadGateway(text=f"Couldn't reach the device at {ip}: {e or 'timed out'}")
+    return web.Response(text="sent")
+
+
+async def handle_cache_delete(request: web.Request) -> web.Response:
+    path = cache_path(request.match_info["key"])
+    try:
+        with open(path) as f:
+            phrase = json.load(f).get("phrase")
+        os.remove(path)
+    except FileNotFoundError:
+        raise web.HTTPNotFound(text="no such cache entry")
+    log.info("deleted cached %r", phrase)
+    return web.Response(text="deleted")
 
 
 async def on_startup(app: web.Application):
@@ -527,6 +755,10 @@ def main():
     app.router.add_get("/last.wav", handle_last_wav)
     app.router.add_post("/draw", handle_draw)
     app.router.add_post("/draw_text", handle_draw_text)
+    app.router.add_delete("/cache/{key}", handle_cache_delete)
+    app.router.add_get("/cache/{key}/device", handle_cache_device)
+    app.router.add_post("/cache/{key}/send", handle_cache_send)
+    app.router.add_post("/hello", handle_hello)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     web.run_app(app, port=PORT, access_log=None)

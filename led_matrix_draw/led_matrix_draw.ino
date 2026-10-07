@@ -2,9 +2,12 @@
 // Audio goes to the relay add-on (speech to text + Claude), which returns 16x16 RGB pixels.
 // While a picture is showing the button belongs to it: presses go to its Lua script, and
 // holding for HOLD_CLEAR_MS clears it so the next hold records again.
+// The relay page's Send button POSTs a saved entry's key to /show here; the device then fetches
+// that entry from the relay and shows it like a spoken one.
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <esp_http_server.h>
 #include <FastLED.h>
 #include "secrets.h"
 #include "panel.h"
@@ -31,6 +34,8 @@
 #define MAX_FRAMES  4                        // hand-drawn animations; code animations run as Lua
 #define FRAME_BYTES (NUM_LEDS * 3)           // one frame: 16x16 RGB, row-major, top-left first
 #define MAX_SCRIPT_BYTES 16384               // largest Lua animation script we accept
+#define KEY_LENGTH  40                       // a relay cache key: 40 hex characters
+#define HELLO_RETRY_MS 30000                 // how often to retry telling the relay our IP
 
 enum State { CONNECTING, IDLE, SHOWING, RECORDING, THINKING, ERROR_SHOWN };
 
@@ -53,6 +58,11 @@ uint32_t pressesSeen = 0, releasesSeen = 0;
 
 uint8_t *audioBuf = nullptr;
 size_t audioCap = 0;
+
+// Saved entries sent from the relay page: the web server task puts the key here, loop() shows it
+QueueHandle_t sentKeys;
+bool helloNeeded = true;   // the relay doesn't know our current IP yet
+uint32_t helloAt = 0;
 
 // Clockwise path around each ring, outermost first, ending at the center
 uint8_t spiralX[NUM_LEDS], spiralY[NUM_LEDS];
@@ -288,18 +298,11 @@ bool loadLuaResponse(HTTPClient &http) {
   return true;
 }
 
-bool sendToRelay(size_t samples) {
-  HTTPClient http;
-  http.begin(String(RELAY_URL) + "/draw");
-  http.setConnectTimeout(5000);
-  http.setTimeout(45000);
-  http.addHeader("Content-Type", "application/octet-stream");
-  http.addHeader("X-Sample-Rate", String(SAMPLE_RATE));
-  const char *keys[] = {"X-Transcript", "X-Title", "X-Mode", "X-Frames", "X-Frame-Ms"};
-  http.collectHeaders(keys, 5);
+const char *PICTURE_HEADERS[] = {"X-Transcript", "X-Title", "X-Mode", "X-Frames", "X-Frame-Ms"};
 
-  uint32_t t0 = millis();
-  int code = http.POST(audioBuf, samples);
+// Reads a relay response (a still, frames, or a Lua script) into the picture. Only call when
+// the state isn't SHOWING, so the display task isn't using the old one.
+bool loadPicture(HTTPClient &http, int code, uint32_t t0) {
   if (code != 200) {
     String why = code > 0 ? http.getString() : http.errorToString(code);
     Serial.printf("relay error %d: %s\n", code, why.c_str());
@@ -307,8 +310,6 @@ bool sendToRelay(size_t samples) {
     return false;
   }
 
-  // Safe to replace frameData or the Lua script here: the display task only uses them
-  // in the SHOWING state, and we're in THINKING.
   hasPicture = false;
   luaRunning = false;
   String title = urlDecode(http.header("X-Title"));
@@ -345,6 +346,83 @@ bool sendToRelay(size_t samples) {
   animStart = millis();
   hasPicture = true;
   return true;
+}
+
+bool sendToRelay(size_t samples) {
+  HTTPClient http;
+  http.begin(String(RELAY_URL) + "/draw");
+  http.setConnectTimeout(5000);
+  http.setTimeout(45000);
+  http.addHeader("Content-Type", "application/octet-stream");
+  http.addHeader("X-Sample-Rate", String(SAMPLE_RATE));
+  http.addHeader("X-Device-IP", WiFi.localIP().toString());
+  http.collectHeaders(PICTURE_HEADERS, 5);
+  uint32_t t0 = millis();
+  return loadPicture(http, http.POST(audioBuf, samples), t0);
+}
+
+bool fetchSaved(const char *key) {
+  HTTPClient http;
+  http.begin(String(RELAY_URL) + "/cache/" + key + "/device");
+  http.setConnectTimeout(5000);
+  http.setTimeout(15000);
+  http.collectHeaders(PICTURE_HEADERS, 5);
+  uint32_t t0 = millis();
+  return loadPicture(http, http.GET(), t0);
+}
+
+// Tells the relay our IP so its Send button can reach us
+void sayHello() {
+  helloAt = millis();
+  HTTPClient http;
+  http.begin(String(RELAY_URL) + "/hello");
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+  int code = http.POST(WiFi.localIP().toString());
+  http.end();
+  helloNeeded = code != 200;
+  if (helloNeeded) Serial.printf("relay hello failed (%d), retrying later\n", code);
+}
+
+// ---------- web server: the relay's Send button ----------
+
+// Runs on the web server's task: just hand the key to loop()
+esp_err_t handleShow(httpd_req_t *req) {
+  char key[KEY_LENGTH + 1] = {};
+  if (req->content_len != KEY_LENGTH || httpd_req_recv(req, key, KEY_LENGTH) != KEY_LENGTH) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected a cache key");
+    return ESP_FAIL;
+  }
+  xQueueOverwrite(sentKeys, key);
+  httpd_resp_sendstr(req, "ok");
+  return ESP_OK;
+}
+
+void startServer() {
+  sentKeys = xQueueCreate(1, KEY_LENGTH + 1);
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.max_uri_handlers = 1;
+  httpd_handle_t server = nullptr;
+  if (httpd_start(&server, &config) != ESP_OK) {
+    Serial.println("web server failed to start; Send from the relay page won't work");
+    return;
+  }
+  httpd_uri_t show = {};
+  show.uri = "/show";
+  show.method = HTTP_POST;
+  show.handler = handleShow;
+  httpd_register_uri_handler(server, &show);
+}
+
+// Shows a saved entry the relay page sent, if there is one
+void showSent() {
+  char key[KEY_LENGTH + 1];
+  if (!sentKeys || xQueueReceive(sentKeys, key, 0) != pdTRUE) return;
+  Serial.printf("sent from the relay page: %s\n", key);
+  state = THINKING;
+  delay(50);   // let the display task finish any frame of the old picture
+  if (fetchSaved(key)) state = SHOWING;
+  else showError();
 }
 
 // ---------- main ----------
@@ -403,6 +481,7 @@ void setup() {
   xTaskCreatePinnedToCore(displayTask, "display", 16384, nullptr, 1, nullptr, 0);
 
   connectWiFi();
+  startServer();
 
   frameData = (uint8_t *)malloc(MAX_FRAMES * FRAME_BYTES);
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
@@ -417,12 +496,15 @@ void setup() {
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     state = CONNECTING;
+    helloNeeded = true;   // we may come back with a different IP
     delay(500);
     return;
   }
   if (state == CONNECTING) state = restingState();
+  if (helloNeeded && (helloAt == 0 || millis() - helloAt > HELLO_RETRY_MS)) sayHello();
 
   if (!buttonHeld()) {
+    showSent();
     delay(5);
     return;
   }

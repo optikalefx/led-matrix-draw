@@ -8,7 +8,15 @@ HTTP relay for the ESP32 16x16 LED matrix: speech to text (OpenAI), then Claude 
   or a WAV file (`Content-Type: audio/wav`). Transcribes it, then draws it.
 - `POST /draw_text` - body is plain text to draw (skips speech to text). Add `?preview=1`
   to get rendered frames even for Lua animations.
-- `GET /` - the last drawing (animated), its code if any, and the last recording.
+- `GET /` - the last drawing (animated), its code if any, the last recording, and every saved
+  drawing with a Delete button.
+- `DELETE /cache/{key}` - deletes one saved drawing.
+- `POST /cache/{key}/send` - the page's Send button: tells the device to show a saved drawing.
+- `GET /cache/{key}/device` - a saved drawing in the same format `/draw` returns; the device
+  fetches it after a Send.
+- `POST /hello` - body is the device's IP; the device says hello at boot so Send can reach it.
+
+The page also opens from the Home Assistant sidebar ("LED Matrix").
 - `GET /last.wav` - the last recording.
 
 ## What comes back
@@ -24,6 +32,17 @@ Every response has `X-Transcript`, `X-Title` (URL-encoded) and `X-Mode`:
   with `lua_runner.lua` first (same drawing API and limits as the device) and asks Claude to fix
   it once if it fails. Scripts that ask for the button define `press(t)` / `release(t)` and can
   read `button()`; the preview simulates one press at 1s so those handlers get tested too.
+
+## Saved drawings
+
+Every result is saved in `/data/cache` under its phrase, so saying the same thing again shows
+the saved one instantly without asking Claude (`X-Cached: 1`). Phrases are matched loosely:
+"draw me a red heart!" and "a red heart" are the same, and "code a ball" and "write code for a
+ball" are too. Start with "another", "a different" or "redraw" ("another cat") to draw it fresh
+and replace the saved one. Changing `claude_model` starts over with fresh drawings.
+
+Send on a saved drawing shows it on the device right away: the relay POSTs its key to the
+device's `/show` (port 80), and the device fetches it from `/cache/{key}/device`.
 
 ## Button on the device
 

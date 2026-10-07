@@ -6,3 +6,6 @@ build/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Relay cache when run locally
+relay/led_matrix_draw/cache/
